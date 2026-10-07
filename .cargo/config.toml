@@ -1,0 +1,4 @@
+# mahoraga recurses once per nesting level: the default 1MB wasm stack traps at ~1500 levels.
+# With 8MB the engine's native stack becomes the limit instead (see DEFAULT_MAX_LENGTH).
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=8388608"]
