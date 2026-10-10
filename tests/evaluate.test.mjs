@@ -202,3 +202,36 @@ test("deep nesting at maxLength never traps", () => {
   }
   assert.equal(evaluate("1 + 1"), 2);
 });
+
+test("closures become callable JS functions", () => {
+  const add = evaluate("|a, b| a + b * k", { k: 10 });
+  assert.equal(typeof add, "function");
+  assert.equal(add.length, 2);
+  assert.equal(add(1, 2), 21);
+  assert.equal(add(3, 4), 43);
+  assert.deepEqual(evaluate("[|x| x * 2]")[0](4), 8);
+});
+
+test("closure errors are EvalErrors spanning the original expression", () => {
+  const expr = "|x| x + 1";
+  const err = throwsMahoraga(() => evaluate(expr)("a"), "EvalError");
+  assert.equal(err.expr, expr);
+  assert.equal(expr.slice(...err.span), "x + 1");
+});
+
+test("closures can be passed to context functions", () => {
+  const ctx = { apply: (f, v) => f(v) };
+  assert.equal(evaluate("apply(|x| x * k, 3)", { ...ctx, k: 2 }), 6);
+  const expr = "apply(|x| x + 1, 'a')";
+  const err = throwsMahoraga(() => evaluate(expr, ctx), "EvalError");
+  assert.equal(err.cause.name, "EvalError");
+  assert.equal(err.cause.expr, expr);
+  assert.equal(expr.slice(...err.cause.span), "x + 1");
+});
+
+test("closures returned from closures can call context functions", () => {
+  const f = evaluate("|x| x | double", { double: (n) => n * 2 });
+  assert.equal(f(5), 10);
+  assert.throws(() => evaluate("|x| x | boom", { boom: (_) => { throw new Error("no"); } })(1), (e) =>
+    e.name === "EvalError" && e.cause.message === "no");
+});

@@ -1,14 +1,30 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::{Rc, Weak},
+};
 
 use js_sys::{
-    Array as JsArray, Error, Function as JsFunction, Object as JsObject, RangeError, Reflect,
-    TypeError,
+    Array as JsArray, Error as JsError, Function as JsFunction, Object as JsObject, RangeError,
+    Reflect, TypeError,
 };
 use mahoraga::{
-    Args, Callable, ErrorKind, Function, FunctionCallError, RuntimeError, Value,
+    Args, Callable, Env, ErrorKind, Function, FunctionCallError, RuntimeEnv, RuntimeError, Value,
     value::{Array, Number, Object},
 };
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{closure::Closure as JsClosure, prelude::*};
+
+#[wasm_bindgen(inline_js = r#"
+export function variadic(f, length) {
+  const g = (...args) => f(args);
+  Object.defineProperty(g, "length", { value: length });
+  return g;
+}
+"#)]
+extern "C" {
+    /// wasm-bindgen closures take a fixed parameter list, this spreads JS call arguments into one array.
+    fn variadic(f: JsValue, length: u32) -> JsFunction;
+}
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_API: &str = r#"
@@ -17,6 +33,8 @@ const TS_API: &str = r#"
  *
  * `context` keys become top-level identifiers in the expression. Functions in
  * `context` are callable from the expression; their `length` is the arity.
+ * Closures in the result, or passed to a context function, become JS functions
+ * that stay callable after `evaluate` returns.
  * `maxLength` bounds the expression size (in UTF-16 units) to keep deeply
  * nested input from exhausting the stack.
  *
@@ -48,21 +66,35 @@ thread_local! {
     static LAST_THROWN: RefCell<Option<JsValue>> = const { RefCell::new(None) };
 }
 
+/// One `evaluate` call: the env it built and the expression its spans point into.
+/// Closures that escape to JS keep it alive.
+struct Ctx {
+    env: Env,
+    expr: Rc<str>,
+}
+
 /// A JS function exposed to mahoraga. Arity comes from `fn.length`.
 struct JsCallable {
     f: JsFunction,
     name: Rc<str>,
+    /// Weak, since `ctx.env` owns this callable.
+    ctx: Weak<Ctx>,
 }
 
 impl Callable for JsCallable {
-    fn call(&self, Args(args): Args) -> Result<Value, FunctionCallError> {
+    fn call(&self, _: &mut RuntimeEnv<'_>, Args(args): Args) -> Result<Value, FunctionCallError> {
         let fail = |message: String, thrown: JsValue| {
             LAST_THROWN.set(Some(thrown));
             FunctionCallError::External(message)
         };
+        // Being called means its env is running, so the ctx is alive.
+        let ctx = self
+            .ctx
+            .upgrade()
+            .expect("context function outlived its evaluate call");
         let js_args = JsArray::new_with_length(args.len() as u32);
         for (i, v) in args.into_iter().enumerate() {
-            let v = to_js(v).map_err(|e| {
+            let v = to_js(&ctx, v).map_err(|e| {
                 let message = format!("argument {} of {}: {}", i + 1, self.name, error_message(&e));
                 fail(message, e)
             })?;
@@ -72,7 +104,7 @@ impl Callable for JsCallable {
             .f
             .apply(&JsValue::UNDEFINED, &js_args)
             .map_err(|e| fail(format!("{} threw: {}", self.name, error_message(&e)), e))?;
-        from_js(&out, 0).map_err(|e| {
+        from_js(&out, 0, &self.ctx).map_err(|e| {
             fail(
                 format!(
                     "{} returned an unsupported value: {}",
@@ -89,26 +121,30 @@ impl Callable for JsCallable {
     }
 }
 
-fn js_function(f: JsFunction) -> Value {
+fn js_function(f: JsFunction, ctx: &Weak<Ctx>) -> Value {
     let name = f.name().as_string().filter(|n| !n.is_empty());
     let name: Rc<str> = Rc::from(name.as_deref().unwrap_or("anonymous"));
     Value::Function(Rc::new(Function {
         name: name.clone(),
         help: None,
-        f: Box::new(JsCallable { f, name }),
+        f: Box::new(JsCallable {
+            f,
+            name,
+            ctx: ctx.clone(),
+        }),
     }))
 }
 
 /// `message` of an Error, the value itself if it's a string.
 fn error_message(v: &JsValue) -> String {
-    if let Some(e) = v.dyn_ref::<Error>() {
+    if let Some(e) = v.dyn_ref::<JsError>() {
         return e.message().into();
     }
     v.as_string()
         .unwrap_or_else(|| format!("non-Error value of type '{}'", type_name(v)))
 }
 
-fn from_js(v: &JsValue, depth: usize) -> Result<Value, JsValue> {
+fn from_js(v: &JsValue, depth: usize, ctx: &Weak<Ctx>) -> Result<Value, JsValue> {
     if depth > MAX_CONTEXT_DEPTH {
         return Err(RangeError::new(&format!(
             "value is nested deeper than {MAX_CONTEXT_DEPTH} levels"
@@ -142,14 +178,18 @@ fn from_js(v: &JsValue, depth: usize) -> Result<Value, JsValue> {
     }
     if JsArray::is_array(v) {
         let arr = JsArray::from(v);
-        let items = arr.iter().map(|v| from_js(&v, depth + 1));
+        let items = arr.iter().map(|v| from_js(&v, depth + 1, ctx));
         return Ok(Value::Array(Array(items.collect::<Result<_, _>>()?)));
     }
     if is_plain_object(v) {
-        return Ok(Value::Object(object_from_js(v.unchecked_ref(), depth + 1)?));
+        return Ok(Value::Object(object_from_js(
+            v.unchecked_ref(),
+            depth + 1,
+            ctx,
+        )?));
     }
     if let Some(f) = v.dyn_ref::<JsFunction>() {
-        return Ok(js_function(f.clone()));
+        return Ok(js_function(f.clone(), ctx));
     }
     Err(TypeError::new(&format!("unsupported value of type '{}'", type_name(v))).into())
 }
@@ -175,18 +215,18 @@ fn type_name(v: &JsValue) -> String {
         .unwrap_or(type_of)
 }
 
-fn object_from_js(obj: &JsObject, depth: usize) -> Result<Object, JsValue> {
+fn object_from_js(obj: &JsObject, depth: usize, ctx: &Weak<Ctx>) -> Result<Object, JsValue> {
     let entries = JsObject::entries(obj);
     let mut map = HashMap::with_capacity(entries.length() as usize);
     for entry in entries.iter() {
         let entry = JsArray::from(&entry);
         let key = entry.get(0).as_string().unwrap_or_default();
-        map.insert(key, from_js(&entry.get(1), depth)?);
+        map.insert(key, from_js(&entry.get(1), depth, ctx)?);
     }
     Ok(Object(map))
 }
 
-fn to_js(value: Value) -> Result<JsValue, JsValue> {
+fn to_js(ctx: &Rc<Ctx>, value: Value) -> Result<JsValue, JsValue> {
     Ok(match value {
         Value::String(s) => JsValue::from_str(&s),
         // Integers beyond 2^53 lose precision, same as JSON.parse.
@@ -194,22 +234,39 @@ fn to_js(value: Value) -> Result<JsValue, JsValue> {
         Value::Number(Number::Float(f)) => JsValue::from_f64(f),
         Value::Bool(b) => JsValue::from_bool(b),
         Value::Object(Object(map)) => {
-            // Object.fromEntries defines own properties, so a "__proto__" key stays a plain key.
             let entries = JsArray::new_with_length(map.len() as u32);
             for (i, (k, v)) in map.into_iter().enumerate() {
-                entries.set(i as u32, JsArray::of2(&k.into(), &to_js(v)?).into());
+                entries.set(i as u32, JsArray::of2(&k.into(), &to_js(ctx, v)?).into());
             }
             JsObject::from_entries(&entries)?.into()
         }
         Value::Array(Array(items)) => {
             let arr = JsArray::new_with_length(items.len() as u32);
             for (i, v) in items.into_iter().enumerate() {
-                arr.set(i as u32, to_js(v)?);
+                arr.set(i as u32, to_js(ctx, v)?);
             }
             arr.into()
         }
         Value::Function(_) => {
             return Err(TypeError::new("functions can't be converted to JS values").into());
+        }
+        Value::Closure(closure) => {
+            let ctx = ctx.clone();
+            let arity = closure.args.len() as u32;
+            let f = JsClosure::<dyn Fn(JsArray) -> Result<JsValue, JsValue>>::new(
+                move |js_args: JsArray| {
+                    let weak = Rc::downgrade(&ctx);
+                    let args = js_args
+                        .iter()
+                        .map(|v| from_js(&v, 0, &weak))
+                        .collect::<Result<_, _>>()?;
+                    let res = closure.call(&mut RuntimeEnv::new(&ctx.env), Args(args));
+                    let thrown = LAST_THROWN.take();
+                    let v = res.map_err(|e| map_err(&ctx.expr, ErrorKind::Runtime(e), thrown))?;
+                    to_js(&ctx, v)
+                },
+            );
+            variadic(f.into_js_value(), arity).into()
         }
         Value::Null => JsValue::NULL,
         Value::Void => JsValue::UNDEFINED,
@@ -233,7 +290,7 @@ fn map_err(expr: &str, err: ErrorKind, thrown: Option<JsValue>) -> JsValue {
         ErrorKind::Parser(e) => ("ParserError", e.inner.to_string()),
         ErrorKind::Runtime(e) => ("EvalError", e.inner.to_string()),
     };
-    let js_err = Error::new(&message);
+    let js_err = JsError::new(&message);
     js_err.set_name(name);
     let span = err.span();
     let span = JsArray::of2(
@@ -264,16 +321,31 @@ pub fn evaluate(expr: &str, context: JsValue, max_length: Option<u32>) -> Result
         ))
         .into());
     }
-    let mut env = mahoraga::Env::std();
-    if !context.is_null() && !context.is_undefined() {
-        if !is_plain_object(&context) {
-            return Err(TypeError::new("context must be a plain object").into());
-        }
-        env.attach_object(object_from_js(context.unchecked_ref(), 0)?);
+    let has_context = !context.is_null() && !context.is_undefined();
+    if has_context && !is_plain_object(&context) {
+        return Err(TypeError::new("context must be a plain object").into());
     }
-    let result = mahoraga::eval_str(expr, &env);
+
+    let mut context_err = None;
+    let ctx = Rc::new_cyclic(|weak| {
+        let mut env = Env::std();
+        if has_context {
+            match object_from_js(context.unchecked_ref(), 0, weak) {
+                Ok(obj) => env.attach_object(obj),
+                Err(e) => context_err = Some(e),
+            }
+        }
+        Ctx {
+            env,
+            expr: Rc::from(expr),
+        }
+    });
+    if let Some(e) = context_err {
+        return Err(e);
+    }
+    let result = mahoraga::eval_str(expr, &ctx.env);
     // Always take it, so a thrown value never outlives the call that caught it.
     let thrown = LAST_THROWN.take();
     let value = result.map_err(|e| map_err(expr, e, thrown))?;
-    to_js(value)
+    to_js(&ctx, value)
 }
